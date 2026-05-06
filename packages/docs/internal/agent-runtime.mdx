@@ -1,49 +1,49 @@
 ---
-title: "Agent runtime internals"
-description: "How OpenCode loops, assembles context, persists reasoning, and completes a real agent turn"
+title: "Agent 运行时原理"
+description: "解释 OpenCode 如何循环执行、组装上下文、持久化 reasoning，并完成一次完整的 Agent 回合"
 ---
 
 ## TODO
 
-- [x] Draw the OpenCode agent runtime architecture
-- [x] Explain the core agent loop with code-level pseudocode
-- [x] Explain how OpenCode assembles and trims context
-- [x] Explain how reasoning is received, stored, and replayed
-- [x] Walk through one real request cycle
+- [x] 画出 OpenCode Agent Runtime 架构图
+- [x] 用代码级伪代码解释核心 Agent Loop
+- [x] 解释 OpenCode 如何组装并裁剪上下文
+- [x] 解释 reasoning 如何被接收、存储和回灌
+- [x] 串一次真实请求的完整循环
 
-All file paths below are relative to the repository root.
+下面所有文件路径都相对于仓库根目录。
 
-## Runtime architecture
+## 运行时架构图
 
 ```mermaid
 flowchart TD
-    U[User message] --> SP[SessionPrompt.loop()<br/>packages/opencode/src/session/prompt.ts]
+    U[用户消息] --> SP[SessionPrompt.loop()<br/>packages/opencode/src/session/prompt.ts]
     SP --> RL[runLoop while true]
-    RL --> AG[Agent.Service<br/>load agent, permissions, steps]
+    RL --> AG[Agent.Service<br/>加载 agent、权限、steps]
     RL --> TR[resolveTools + ToolRegistry]
-    RL --> IN[Instruction.system<br/>AGENTS.md + CLAUDE.md + custom instructions]
+    RL --> IN[Instruction.system<br/>AGENTS.md + CLAUDE.md + 自定义 instructions]
     RL --> SY[SystemPrompt.environment + skills]
-    RL --> MM[MessageV2.toModelMessagesEffect<br/>convert session history to model messages]
+    RL --> MM[MessageV2.toModelMessagesEffect<br/>把会话历史转换成模型消息]
     MM --> LLM[LLM.stream<br/>packages/opencode/src/session/llm.ts]
     LLM --> PR[SessionProcessor.process]
-    PR -->|text + reasoning + tool events| MSG[Assistant and tool parts persisted to session]
-    PR -->|tool call| TOOL[Built-in tools + plugin tools + MCP tools]
+    PR -->|文本 + reasoning + tool 事件| MSG[assistant 和 tool parts 持久化到 session]
+    PR -->|tool call| TOOL[内置工具 + 插件工具 + MCP 工具]
     TOOL --> PR
     PR -->|finish = tool-calls| RL
     PR -->|overflow| CMP[SessionCompaction.process]
     CMP --> RL
-    PR -->|finish = stop| END[Return final assistant message]
+    PR -->|finish = stop| END[返回最终 assistant message]
 
     RL -->|subtask| TASK[Task tool]
-    TASK --> SUB[Sub session or subagent]
+    TASK --> SUB[子会话或子 Agent]
     SUB --> RL
 ```
 
-OpenCode's runtime center is not a single `Agent` class. The real control loop is `runLoop()` in `packages/opencode/src/session/prompt.ts`, with `SessionProcessor`, `LLM.stream()`, `ToolRegistry`, and the task tool forming the rest of the execution path.
+OpenCode 的运行时核心并不是单独一个 `Agent` 类。真正的控制中心是 `packages/opencode/src/session/prompt.ts` 里的 `runLoop()`，再配合 `SessionProcessor`、`LLM.stream()`、`ToolRegistry` 和 task tool，一起组成完整执行路径。
 
-## Core agent loop
+## 核心 Agent Loop
 
-The loop lives at `packages/opencode/src/session/prompt.ts:1400`.
+循环入口位于 `packages/opencode/src/session/prompt.ts:1400`。
 
 ```ts
 function runLoop(sessionID) {
@@ -111,175 +111,175 @@ function runLoop(sessionID) {
 }
 ```
 
-### Why this becomes multi-turn automatically
+### 为什么它会自然变成多轮循环
 
-The loop is state-driven:
+这个 loop 是**状态驱动**的：
 
-1. The model sees system prompt, history, and tool definitions.
-2. If it emits a tool call, `SessionProcessor` persists that call and executes the tool.
-3. The tool result is written back into session history as a tool part.
-4. The next `while (true)` iteration rebuilds model messages from the updated history.
-5. The model now sees its own prior tool call and the tool result, so it can either call more tools or answer.
+1. 模型先看到 system prompt、历史消息和工具定义。
+2. 如果模型发出了 tool call，`SessionProcessor` 会先把这次调用持久化，再执行工具。
+3. 工具结果会被写回会话历史，成为 tool part。
+4. 下一次 `while (true)` 迭代，会基于最新历史重新构造模型消息。
+5. 模型于是能看到自己上一次的工具调用和对应结果，然后决定继续调工具还是直接回答。
 
-That replay step is what turns one model pass into a true agent loop.
+正是这个“回放最新状态”的过程，把单次模型调用变成了真正的 agent loop。
 
-Key code paths:
+关键代码路径：
 
-- Loop exit and re-entry: `packages/opencode/src/session/prompt.ts:1430-1448`
-- Tool resolution: `packages/opencode/src/session/prompt.ts:1526-1535`
-- System and message assembly: `packages/opencode/src/session/prompt.ts:1568-1588`
-- Tool call persistence: `packages/opencode/src/session/processor.ts:319-376`
-- Tool result persistence: `packages/opencode/src/session/processor.ts:378-403`
+- loop 退出与重入：`packages/opencode/src/session/prompt.ts:1430-1448`
+- tool 解析：`packages/opencode/src/session/prompt.ts:1526-1535`
+- system 与消息组装：`packages/opencode/src/session/prompt.ts:1568-1588`
+- tool call 持久化：`packages/opencode/src/session/processor.ts:319-376`
+- tool result 持久化：`packages/opencode/src/session/processor.ts:378-403`
 
-## Context engineering
+## 上下文工程
 
-OpenCode assembles context from four sources, then trims it when needed.
+OpenCode 会从四类来源组装上下文，并在需要时做裁剪。
 
-### 1. System context
+### 1. 系统上下文
 
-Each loop builds a system array from:
+每一轮都会拼出一个 system 数组，来源包括：
 
-- environment facts from `packages/opencode/src/session/system.ts:48-63`
-- instruction files from `packages/opencode/src/session/instruction.ts:106-163`
-- available skills from `packages/opencode/src/session/system.ts:65-77`
+- `packages/opencode/src/session/system.ts:48-63` 的环境信息
+- `packages/opencode/src/session/instruction.ts:106-163` 的 instruction files
+- `packages/opencode/src/session/system.ts:65-77` 的可用 skill 列表
 
-That means the model sees:
+也就是说，模型会看到：
 
-- current working directory
-- workspace root
-- git presence
-- platform and date
-- project instructions from `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, config files, and optional remote instruction URLs
-- a skill index that advertises which specialized workflows can be loaded
+- 当前工作目录
+- workspace 根目录
+- 当前目录是否是 git 仓库
+- 平台和日期
+- 来自 `AGENTS.md`、`CLAUDE.md`、`CONTEXT.md`、配置文件和远程 URL 的项目 instructions
+- 一个 skill 索引，告诉模型有哪些专门工作流可以按需加载
 
-### 2. History context
+### 2. 历史消息上下文
 
-`MessageV2.toModelMessagesEffect()` converts session history into provider-facing messages:
+`MessageV2.toModelMessagesEffect()` 会把 session history 转成 provider 侧真正消费的消息：
 
-- user text stays as text
-- user files become file parts when supported
-- assistant text stays as assistant text
-- completed tools become `tool-*` output parts
-- failed or interrupted tools become output errors
-- reasoning can be replayed when the provider and model match
+- user text 保持为 text
+- user files 在支持时转为 file parts
+- assistant text 保持为 assistant text
+- 已完成工具调用会转成 `tool-*` output parts
+- 失败或中断的工具会转成 output errors
+- 如果 provider 和 model 没变，reasoning 也可以被回灌
 
-Main code path:
+主要代码路径：
 
 - `packages/opencode/src/session/message-v2.ts:729-980`
 
-### 3. Tool context
+### 3. 工具上下文
 
-Tools are not exposed as raw functions. `ToolRegistry` builds a runtime-aware tool set, then `resolveTools()` wires in session IDs, message IDs, permissions, plugin hooks, and execution behavior.
+工具并不是裸函数。`ToolRegistry` 先构建带运行时语义的工具集合，随后 `resolveTools()` 再把 session ID、message ID、权限控制、plugin hooks 和执行行为一起接进去。
 
-Relevant files:
+相关文件：
 
 - `packages/opencode/src/tool/registry.ts:62-180`
 - `packages/opencode/src/session/prompt.ts:382-545`
 
-### 4. Skill context
+### 4. Skill 上下文
 
-Skills are loaded lazily:
+Skill 使用的是惰性加载：
 
-1. `SystemPrompt.skills()` only injects the available skill list.
-2. If the model invokes the `skill` tool, the actual `SKILL.md` content and sampled files are injected into the conversation.
+1. `SystemPrompt.skills()` 只先注入可用 skill 列表。
+2. 如果模型真的调用 `skill` tool，才会把对应 `SKILL.md` 内容和采样文件注入对话。
 
-Relevant code:
+相关代码：
 
-- skill list: `packages/opencode/src/session/system.ts:65-77`
-- lazy load: `packages/opencode/src/tool/skill.ts:14-75`
+- skill 列表：`packages/opencode/src/session/system.ts:65-77`
+- lazy load：`packages/opencode/src/tool/skill.ts:14-75`
 
-## Context trimming
+## 上下文裁剪
 
-When history grows too large, OpenCode uses both compaction and pruning.
+当历史越来越长时，OpenCode 会同时使用 compaction 和 pruning。
 
 ### Compaction
 
-`SessionCompaction.process()`:
+`SessionCompaction.process()` 会做这些事：
 
-1. finds earlier compaction summaries
-2. keeps the recent tail of turns
-3. summarizes the older head with an anchored summary prompt
-4. stores the summary as an assistant message in compaction mode
+1. 找到更早之前的 compaction summaries
+2. 保留最近几轮对话的 tail
+3. 对更老的 head 做 anchored summary
+4. 把摘要作为 compaction 模式下的 assistant message 保存起来
 
-Important code:
+关键代码：
 
-- summary prompt shape: `packages/opencode/src/session/compaction.ts:43-78`
-- tail selection: `packages/opencode/src/session/compaction.ts:247-296`
-- compaction execution: `packages/opencode/src/session/compaction.ts:346-470`
+- summary prompt 结构：`packages/opencode/src/session/compaction.ts:43-78`
+- tail 选择逻辑：`packages/opencode/src/session/compaction.ts:247-296`
+- compaction 执行：`packages/opencode/src/session/compaction.ts:346-470`
 
 ### Pruning
 
-Old completed tool outputs can be marked compacted once enough newer context exists. That preserves the action history while dropping bulky tool payloads.
+足够旧的已完成 tool outputs 会被标记为 compacted。这样既保留了执行历史，又能把体积很大的工具输出从上下文里裁掉。
 
-Relevant code:
+相关代码：
 
 - `packages/opencode/src/session/compaction.ts:298-343`
 
 ## Reasoning
 
-OpenCode does not implement the model's internal thinking. It orchestrates reasoning traces that providers choose to expose.
+OpenCode 并不负责实现模型内部的“思考”。它负责的是编排 provider 愿意暴露出来的 reasoning traces。
 
-### How reasoning enters the system
+### Reasoning 如何进入系统
 
-Provider adapters emit normalized reasoning events such as:
+provider 适配层会发出统一化后的 reasoning 事件，例如：
 
 - `reasoning-start`
 - `reasoning-delta`
 - `reasoning-end`
 
-Example adapter:
+一个具体例子：
 
 - `packages/opencode/src/provider/sdk/copilot/responses/openai-responses-language-model.ts:1234-1259`
 
-### How reasoning is stored
+### Reasoning 如何被存储
 
-`SessionProcessor` turns those stream events into `ReasoningPart` records:
+`SessionProcessor` 会把这些流式事件转成 `ReasoningPart`：
 
-- start: create part
-- delta: append text
-- end: finalize timestamps and metadata
+- start：创建 part
+- delta：追加文本
+- end：补全时间戳和 metadata
 
-Relevant files:
+相关文件：
 
-- part schema: `packages/opencode/src/session/message-v2.ts:129-141`
-- event handling: `packages/opencode/src/session/processor.ts:226-274`
+- part 结构：`packages/opencode/src/session/message-v2.ts:129-141`
+- 事件处理：`packages/opencode/src/session/processor.ts:226-274`
 
-### How reasoning is replayed
+### Reasoning 如何被回灌
 
-When OpenCode rebuilds model messages, reasoning is only preserved as a reasoning part when the provider and model still match. If the provider changes, OpenCode degrades safely instead of replaying provider-specific reasoning protocol data into a different model.
+OpenCode 重建模型消息时，只有在 provider 和 model 仍然一致的情况下，才会把 reasoning 继续作为 reasoning part 回灌。如果 provider 变了，系统会安全降级，而不会把某个 provider 私有的 reasoning 协议原样喂给另一个模型。
 
-Relevant code:
+相关代码：
 
 - `packages/opencode/src/session/message-v2.ts:940-954`
 
-### Practical interpretation
+### 更工程化的理解
 
-OpenCode reasoning has three layers:
+OpenCode 的 reasoning 可以分成三层：
 
-1. hidden model-internal reasoning that OpenCode cannot inspect
-2. provider-exposed reasoning summaries that OpenCode can persist
-3. visible agentic reasoning done by using tools, reading results, and deciding the next action
+1. 模型内部的 latent reasoning，OpenCode 看不见
+2. provider 暴露出来的 reasoning summary，OpenCode 可以持久化
+3. 通过调工具、读结果、做决策而外化出来的 agentic reasoning
 
-The third layer is the important systems view. The loop externalizes reasoning into executable steps.
+第三层才是系统视角下最重要的部分：loop 把“思考”外化成了一连串可执行步骤。
 
-## One real request cycle
+## 一次真实请求循环
 
-Request:
+请求示例：
 
-> Find the core OpenCode agent loop and explain how it manages tools and skills.
+> 找出 OpenCode 的核心 Agent loop，并解释它如何管理 tools 和 skills。
 
 ### Round 0
 
-- a user message is stored
-- `SessionPrompt.loop()` starts `runLoop()`
+- 用户消息入库
+- `SessionPrompt.loop()` 启动 `runLoop()`
 
-Relevant entrypoint:
+相关入口：
 
 - `packages/opencode/src/session/prompt.ts:1630-1634`
 
 ### Round 1
 
-The model receives:
+模型会看到：
 
 - provider prompt
 - environment block
@@ -288,37 +288,37 @@ The model receives:
 - conversation history
 - tool definitions
 
-It often decides to call tools like `glob`, `grep`, or `read`.
+这时它通常会决定调用 `glob`、`grep`、`read` 之类的工具。
 
-At that point:
+随后会发生：
 
-- `SessionProcessor` stores the tool call
-- the tool executes
-- the tool result is written back into the assistant message
+- `SessionProcessor` 先记录 tool call
+- 工具被执行
+- 工具结果被写回 assistant message
 
-Because the assistant finished with `tool-calls`, the loop continues instead of exiting.
+因为 assistant 的 finish 是 `tool-calls`，所以 loop 不会退出，而是继续下一轮。
 
 ### Round 2
 
-The next iteration rebuilds messages from session state. Now the model sees:
+下一次迭代会根据最新 session state 重建消息。此时模型能看到：
 
-- its own previous tool call
-- the returned tool output
-- the same tool menu, unless agent permissions changed
+- 自己上一次发出的 tool call
+- 工具返回的输出
+- 仍然可用的工具集合（除非 agent 权限在中间发生变化）
 
-Now it can either:
+然后它会做两种选择之一：
 
-- call more tools, which creates another loop turn
-- or synthesize a final answer, which exits the loop
+- 继续调更多工具，进入下一轮
+- 或者直接综合成最终回答，结束 loop
 
-This is the core pattern behind OpenCode's multi-turn execution:
+这就是 OpenCode 多轮执行最核心的模式：
 
 `model -> tool call -> tool result -> rebuilt context -> model`
 
-## Summary
+## 总结
 
-- `runLoop()` is the real runtime center
-- tool calls are the back-edge that creates multi-turn execution
-- context is assembled from environment, instructions, skills, messages, and tools
-- compaction and pruning keep the prompt inside model limits
-- reasoning is provider-generated, but OpenCode stores and replays it as part of the session state
+- `runLoop()` 才是真正的运行时中心
+- tool call 是形成多轮执行的回边
+- 上下文由 environment、instructions、skills、messages 和 tools 一起组装
+- compaction 与 pruning 用来把 prompt 控制在模型上下文窗口之内
+- reasoning 由 provider 或模型产生，但 OpenCode 会把它持久化并在后续回合中回放
