@@ -11,18 +11,20 @@ description: "How OpenCode loops, assembles context, persists reasoning, and com
 - [x] Explain how reasoning is received, stored, and replayed
 - [x] Walk through one real request cycle
 
+All file paths below are relative to the repository root.
+
 ## Runtime architecture
 
 ```mermaid
 flowchart TD
-    U[User message] --> SP[SessionPrompt.loop()<br/>/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts]
+    U[User message] --> SP[SessionPrompt.loop()<br/>packages/opencode/src/session/prompt.ts]
     SP --> RL[runLoop while true]
     RL --> AG[Agent.Service<br/>load agent, permissions, steps]
     RL --> TR[resolveTools + ToolRegistry]
     RL --> IN[Instruction.system<br/>AGENTS.md + CLAUDE.md + custom instructions]
     RL --> SY[SystemPrompt.environment + skills]
     RL --> MM[MessageV2.toModelMessagesEffect<br/>convert session history to model messages]
-    MM --> LLM[LLM.stream<br/>/home/runner/work/opencode/opencode/packages/opencode/src/session/llm.ts]
+    MM --> LLM[LLM.stream<br/>packages/opencode/src/session/llm.ts]
     LLM --> PR[SessionProcessor.process]
     PR -->|text + reasoning + tool events| MSG[Assistant and tool parts persisted to session]
     PR -->|tool call| TOOL[Built-in tools + plugin tools + MCP tools]
@@ -37,11 +39,11 @@ flowchart TD
     SUB --> RL
 ```
 
-OpenCode's runtime center is not a single `Agent` class. The real control loop is `runLoop()` in `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts`, with `SessionProcessor`, `LLM.stream()`, `ToolRegistry`, and the task tool forming the rest of the execution path.
+OpenCode's runtime center is not a single `Agent` class. The real control loop is `runLoop()` in `packages/opencode/src/session/prompt.ts`, with `SessionProcessor`, `LLM.stream()`, `ToolRegistry`, and the task tool forming the rest of the execution path.
 
 ## Core agent loop
 
-The loop lives at `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1400`.
+The loop lives at `packages/opencode/src/session/prompt.ts:1400`.
 
 ```ts
 function runLoop(sessionID) {
@@ -123,11 +125,11 @@ That replay step is what turns one model pass into a true agent loop.
 
 Key code paths:
 
-- Loop exit and re-entry: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1430-1448`
-- Tool resolution: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1526-1535`
-- System and message assembly: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1568-1588`
-- Tool call persistence: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:319-376`
-- Tool result persistence: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:378-403`
+- Loop exit and re-entry: `packages/opencode/src/session/prompt.ts:1430-1448`
+- Tool resolution: `packages/opencode/src/session/prompt.ts:1526-1535`
+- System and message assembly: `packages/opencode/src/session/prompt.ts:1568-1588`
+- Tool call persistence: `packages/opencode/src/session/processor.ts:319-376`
+- Tool result persistence: `packages/opencode/src/session/processor.ts:378-403`
 
 ## Context engineering
 
@@ -137,9 +139,9 @@ OpenCode assembles context from four sources, then trims it when needed.
 
 Each loop builds a system array from:
 
-- environment facts from `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:48-63`
-- instruction files from `/home/runner/work/opencode/opencode/packages/opencode/src/session/instruction.ts:106-163`
-- available skills from `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:65-77`
+- environment facts from `packages/opencode/src/session/system.ts:48-63`
+- instruction files from `packages/opencode/src/session/instruction.ts:106-163`
+- available skills from `packages/opencode/src/session/system.ts:65-77`
 
 That means the model sees:
 
@@ -163,7 +165,7 @@ That means the model sees:
 
 Main code path:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:729-980`
+- `packages/opencode/src/session/message-v2.ts:729-980`
 
 ### 3. Tool context
 
@@ -171,8 +173,8 @@ Tools are not exposed as raw functions. `ToolRegistry` builds a runtime-aware to
 
 Relevant files:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/tool/registry.ts:62-180`
-- `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:382-545`
+- `packages/opencode/src/tool/registry.ts:62-180`
+- `packages/opencode/src/session/prompt.ts:382-545`
 
 ### 4. Skill context
 
@@ -183,8 +185,8 @@ Skills are loaded lazily:
 
 Relevant code:
 
-- skill list: `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:65-77`
-- lazy load: `/home/runner/work/opencode/opencode/packages/opencode/src/tool/skill.ts:14-75`
+- skill list: `packages/opencode/src/session/system.ts:65-77`
+- lazy load: `packages/opencode/src/tool/skill.ts:14-75`
 
 ## Context trimming
 
@@ -201,9 +203,9 @@ When history grows too large, OpenCode uses both compaction and pruning.
 
 Important code:
 
-- summary prompt shape: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:43-78`
-- tail selection: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:247-296`
-- compaction execution: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:346-470`
+- summary prompt shape: `packages/opencode/src/session/compaction.ts:43-78`
+- tail selection: `packages/opencode/src/session/compaction.ts:247-296`
+- compaction execution: `packages/opencode/src/session/compaction.ts:346-470`
 
 ### Pruning
 
@@ -211,7 +213,7 @@ Old completed tool outputs can be marked compacted once enough newer context exi
 
 Relevant code:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:298-343`
+- `packages/opencode/src/session/compaction.ts:298-343`
 
 ## Reasoning
 
@@ -227,7 +229,7 @@ Provider adapters emit normalized reasoning events such as:
 
 Example adapter:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/provider/sdk/copilot/responses/openai-responses-language-model.ts:1234-1259`
+- `packages/opencode/src/provider/sdk/copilot/responses/openai-responses-language-model.ts:1234-1259`
 
 ### How reasoning is stored
 
@@ -239,8 +241,8 @@ Example adapter:
 
 Relevant files:
 
-- part schema: `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:129-141`
-- event handling: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:226-274`
+- part schema: `packages/opencode/src/session/message-v2.ts:129-141`
+- event handling: `packages/opencode/src/session/processor.ts:226-274`
 
 ### How reasoning is replayed
 
@@ -248,7 +250,7 @@ When OpenCode rebuilds model messages, reasoning is only preserved as a reasonin
 
 Relevant code:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:940-954`
+- `packages/opencode/src/session/message-v2.ts:940-954`
 
 ### Practical interpretation
 
@@ -273,7 +275,7 @@ Request:
 
 Relevant entrypoint:
 
-- `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1630-1634`
+- `packages/opencode/src/session/prompt.ts:1630-1634`
 
 ### Round 1
 
