@@ -1,0 +1,322 @@
+---
+title: "Agent runtime internals"
+description: "How OpenCode loops, assembles context, persists reasoning, and completes a real agent turn"
+---
+
+## TODO
+
+- [x] Draw the OpenCode agent runtime architecture
+- [x] Explain the core agent loop with code-level pseudocode
+- [x] Explain how OpenCode assembles and trims context
+- [x] Explain how reasoning is received, stored, and replayed
+- [x] Walk through one real request cycle
+
+## Runtime architecture
+
+```mermaid
+flowchart TD
+    U[User message] --> SP[SessionPrompt.loop()<br/>/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts]
+    SP --> RL[runLoop while true]
+    RL --> AG[Agent.Service<br/>load agent, permissions, steps]
+    RL --> TR[resolveTools + ToolRegistry]
+    RL --> IN[Instruction.system<br/>AGENTS.md + CLAUDE.md + custom instructions]
+    RL --> SY[SystemPrompt.environment + skills]
+    RL --> MM[MessageV2.toModelMessagesEffect<br/>convert session history to model messages]
+    MM --> LLM[LLM.stream<br/>/home/runner/work/opencode/opencode/packages/opencode/src/session/llm.ts]
+    LLM --> PR[SessionProcessor.process]
+    PR -->|text + reasoning + tool events| MSG[Assistant and tool parts persisted to session]
+    PR -->|tool call| TOOL[Built-in tools + plugin tools + MCP tools]
+    TOOL --> PR
+    PR -->|finish = tool-calls| RL
+    PR -->|overflow| CMP[SessionCompaction.process]
+    CMP --> RL
+    PR -->|finish = stop| END[Return final assistant message]
+
+    RL -->|subtask| TASK[Task tool]
+    TASK --> SUB[Sub session or subagent]
+    SUB --> RL
+```
+
+OpenCode's runtime center is not a single `Agent` class. The real control loop is `runLoop()` in `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts`, with `SessionProcessor`, `LLM.stream()`, `ToolRegistry`, and the task tool forming the rest of the execution path.
+
+## Core agent loop
+
+The loop lives at `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1400`.
+
+```ts
+function runLoop(sessionID) {
+  let step = 0
+
+  while (true) {
+    const msgs = loadMessages(sessionID)
+    const lastUser = findLastUser(msgs)
+    const lastAssistant = findLastAssistant(msgs)
+    const lastFinished = findLastFinishedAssistant(msgs)
+    const pendingTasks = collectPendingSubtaskOrCompaction(msgs)
+
+    if (assistantAlreadyFinished(lastUser, lastAssistant) && noPendingToolCalls(lastAssistant)) {
+      break
+    }
+
+    step++
+
+    if (pendingTasks.topIsSubtask()) {
+      handleSubtask(...)
+      continue
+    }
+
+    if (pendingTasks.topIsCompaction()) {
+      const result = processCompaction(...)
+      if (result === "stop") break
+      continue
+    }
+
+    if (lastFinished && contextOverflow(lastFinished)) {
+      createCompaction(...)
+      continue
+    }
+
+    const agent = loadAgent(lastUser.agent)
+    const isLastStep = step >= (agent.steps ?? Infinity)
+    const messages = insertReminders(msgs, agent)
+    const assistant = createAssistantMessage(lastUser, agent)
+    const handle = createProcessor(assistant)
+    const tools = resolveTools(agent, messages)
+
+    const system = [
+      ...environment(model),
+      ...instructionFiles(),
+      ...availableSkills(agent),
+    ]
+
+    const modelMessages = toModelMessages(messages, model)
+    const result = handle.process({
+      system,
+      messages: [...modelMessages, ...(isLastStep ? [MAX_STEPS_REMINDER] : [])],
+      tools,
+    })
+
+    if (structuredOutputProduced()) break
+    if (result === "stop") break
+    if (result === "compact") {
+      createCompaction(...)
+      continue
+    }
+  }
+
+  pruneOldToolOutputs(sessionID)
+  return lastAssistantMessage(sessionID)
+}
+```
+
+### Why this becomes multi-turn automatically
+
+The loop is state-driven:
+
+1. The model sees system prompt, history, and tool definitions.
+2. If it emits a tool call, `SessionProcessor` persists that call and executes the tool.
+3. The tool result is written back into session history as a tool part.
+4. The next `while (true)` iteration rebuilds model messages from the updated history.
+5. The model now sees its own prior tool call and the tool result, so it can either call more tools or answer.
+
+That replay step is what turns one model pass into a true agent loop.
+
+Key code paths:
+
+- Loop exit and re-entry: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1430-1448`
+- Tool resolution: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1526-1535`
+- System and message assembly: `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1568-1588`
+- Tool call persistence: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:319-376`
+- Tool result persistence: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:378-403`
+
+## Context engineering
+
+OpenCode assembles context from four sources, then trims it when needed.
+
+### 1. System context
+
+Each loop builds a system array from:
+
+- environment facts from `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:48-63`
+- instruction files from `/home/runner/work/opencode/opencode/packages/opencode/src/session/instruction.ts:106-163`
+- available skills from `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:65-77`
+
+That means the model sees:
+
+- current working directory
+- workspace root
+- git presence
+- platform and date
+- project instructions from `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, config files, and optional remote instruction URLs
+- a skill index that advertises which specialized workflows can be loaded
+
+### 2. History context
+
+`MessageV2.toModelMessagesEffect()` converts session history into provider-facing messages:
+
+- user text stays as text
+- user files become file parts when supported
+- assistant text stays as assistant text
+- completed tools become `tool-*` output parts
+- failed or interrupted tools become output errors
+- reasoning can be replayed when the provider and model match
+
+Main code path:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:729-980`
+
+### 3. Tool context
+
+Tools are not exposed as raw functions. `ToolRegistry` builds a runtime-aware tool set, then `resolveTools()` wires in session IDs, message IDs, permissions, plugin hooks, and execution behavior.
+
+Relevant files:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/tool/registry.ts:62-180`
+- `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:382-545`
+
+### 4. Skill context
+
+Skills are loaded lazily:
+
+1. `SystemPrompt.skills()` only injects the available skill list.
+2. If the model invokes the `skill` tool, the actual `SKILL.md` content and sampled files are injected into the conversation.
+
+Relevant code:
+
+- skill list: `/home/runner/work/opencode/opencode/packages/opencode/src/session/system.ts:65-77`
+- lazy load: `/home/runner/work/opencode/opencode/packages/opencode/src/tool/skill.ts:14-75`
+
+## Context trimming
+
+When history grows too large, OpenCode uses both compaction and pruning.
+
+### Compaction
+
+`SessionCompaction.process()`:
+
+1. finds earlier compaction summaries
+2. keeps the recent tail of turns
+3. summarizes the older head with an anchored summary prompt
+4. stores the summary as an assistant message in compaction mode
+
+Important code:
+
+- summary prompt shape: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:43-78`
+- tail selection: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:247-296`
+- compaction execution: `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:346-470`
+
+### Pruning
+
+Old completed tool outputs can be marked compacted once enough newer context exists. That preserves the action history while dropping bulky tool payloads.
+
+Relevant code:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/session/compaction.ts:298-343`
+
+## Reasoning
+
+OpenCode does not implement the model's internal thinking. It orchestrates reasoning traces that providers choose to expose.
+
+### How reasoning enters the system
+
+Provider adapters emit normalized reasoning events such as:
+
+- `reasoning-start`
+- `reasoning-delta`
+- `reasoning-end`
+
+Example adapter:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/provider/sdk/copilot/responses/openai-responses-language-model.ts:1234-1259`
+
+### How reasoning is stored
+
+`SessionProcessor` turns those stream events into `ReasoningPart` records:
+
+- start: create part
+- delta: append text
+- end: finalize timestamps and metadata
+
+Relevant files:
+
+- part schema: `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:129-141`
+- event handling: `/home/runner/work/opencode/opencode/packages/opencode/src/session/processor.ts:226-274`
+
+### How reasoning is replayed
+
+When OpenCode rebuilds model messages, reasoning is only preserved as a reasoning part when the provider and model still match. If the provider changes, OpenCode degrades safely instead of replaying provider-specific reasoning protocol data into a different model.
+
+Relevant code:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/session/message-v2.ts:940-954`
+
+### Practical interpretation
+
+OpenCode reasoning has three layers:
+
+1. hidden model-internal reasoning that OpenCode cannot inspect
+2. provider-exposed reasoning summaries that OpenCode can persist
+3. visible agentic reasoning done by using tools, reading results, and deciding the next action
+
+The third layer is the important systems view. The loop externalizes reasoning into executable steps.
+
+## One real request cycle
+
+Request:
+
+> Find the core OpenCode agent loop and explain how it manages tools and skills.
+
+### Round 0
+
+- a user message is stored
+- `SessionPrompt.loop()` starts `runLoop()`
+
+Relevant entrypoint:
+
+- `/home/runner/work/opencode/opencode/packages/opencode/src/session/prompt.ts:1630-1634`
+
+### Round 1
+
+The model receives:
+
+- provider prompt
+- environment block
+- instruction files
+- available skills
+- conversation history
+- tool definitions
+
+It often decides to call tools like `glob`, `grep`, or `read`.
+
+At that point:
+
+- `SessionProcessor` stores the tool call
+- the tool executes
+- the tool result is written back into the assistant message
+
+Because the assistant finished with `tool-calls`, the loop continues instead of exiting.
+
+### Round 2
+
+The next iteration rebuilds messages from session state. Now the model sees:
+
+- its own previous tool call
+- the returned tool output
+- the same tool menu, unless agent permissions changed
+
+Now it can either:
+
+- call more tools, which creates another loop turn
+- or synthesize a final answer, which exits the loop
+
+This is the core pattern behind OpenCode's multi-turn execution:
+
+`model -> tool call -> tool result -> rebuilt context -> model`
+
+## Summary
+
+- `runLoop()` is the real runtime center
+- tool calls are the back-edge that creates multi-turn execution
+- context is assembled from environment, instructions, skills, messages, and tools
+- compaction and pruning keep the prompt inside model limits
+- reasoning is provider-generated, but OpenCode stores and replays it as part of the session state
