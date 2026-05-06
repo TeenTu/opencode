@@ -3,14 +3,6 @@ title: "Agent 运行时内部原理"
 description: "解释 OpenCode 如何循环执行、组装上下文、持久化 reasoning，并完成一次完整的 Agent 回合"
 ---
 
-## TODO
-
-- [x] 画出 OpenCode Agent Runtime 架构图
-- [x] 用代码级伪代码解释核心 Agent Loop
-- [x] 解释 OpenCode 如何组装并裁剪上下文
-- [x] 解释 reasoning 如何被接收、存储和回灌
-- [x] 串一次真实请求的完整循环
-
 下面所有文件路径都相对于仓库根目录。
 
 ## 运行时架构图
@@ -313,7 +305,7 @@ OpenCode 的 reasoning 可以分成三层：
 
 这就是 OpenCode 多轮执行最核心的模式：
 
-`model -> tool call -> tool result -> rebuilt context -> model`
+`模型 -> 工具调用 -> 工具结果 -> 重建上下文 -> 模型`
 
 ## 总结
 
