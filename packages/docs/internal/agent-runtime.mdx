@@ -211,7 +211,7 @@ Skill 使用的是惰性加载：
 
 ## Reasoning
 
-OpenCode 并不负责实现模型内部的“思考”。它负责的是编排 provider 愿意暴露出来的 reasoning traces。
+OpenCode 并不负责实现模型内部的决策过程。它负责的是编排 provider 愿意暴露出来的 reasoning traces。
 
 ### Reasoning 如何进入系统
 
@@ -254,7 +254,7 @@ OpenCode 的 reasoning 可以分成三层：
 2. provider 暴露出来的 reasoning summary，OpenCode 可以持久化
 3. 通过调工具、读结果、做决策而外化出来的 agentic reasoning
 
-第三层才是系统视角下最重要的部分：loop 把“思考”外化成了一连串可执行步骤。
+第三层才是系统视角下最重要的部分：loop 把决策过程外化成了一连串可执行步骤。
 
 ## 一次真实请求循环
 
