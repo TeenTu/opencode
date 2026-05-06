@@ -83,7 +83,7 @@ function runLoop(sessionID) {
       ...availableSkills(agent),
     ]
 
-    const modelMessages = toModelMessages(messages, model)
+    const modelMessages = MessageV2.toModelMessagesEffect(messages, model)
     const result = handle.process({
       system,
       messages: [...modelMessages, ...(isLastStep ? [MAX_STEPS_REMINDER] : [])],
@@ -102,6 +102,8 @@ function runLoop(sessionID) {
   return lastAssistantMessage(sessionID)
 }
 ```
+
+这段伪代码故意保留了源码中的执行顺序：`step++` 发生在 subtask / compaction 分支判断之前，与 `runLoop()` 的真实实现一致。
 
 ### 为什么它会自然变成多轮循环
 
